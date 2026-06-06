@@ -60,7 +60,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	setOpsRequestContext(c, "", false, body)
+	setOpsRequestContext(c, "", false)
 
 	// Validate JSON
 	if !gjson.ValidBytes(body) {
@@ -78,11 +78,15 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	reqStream := gjson.GetBytes(body, "stream").Bool()
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
 
-	setOpsRequestContext(c, reqModel, reqStream, body)
+	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
+	requestCtx := c.Request.Context()
+	if service.IsImageGenerationIntent("/v1/responses", reqModel, body) {
+		requestCtx = service.WithOpenAIImageGenerationIntent(requestCtx)
+	}
 
 	// 解析渠道级模型映射
-	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(requestCtx, apiKey.GroupID, reqModel)
 
 	// Claude Code only restriction:
 	// /v1/responses is never a Claude Code endpoint.
@@ -93,6 +97,11 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	if apiKey.Group != nil && apiKey.Group.ClaudeCodeOnly {
 		h.responsesErrorResponse(c, http.StatusForbidden, "permission_error",
 			"This group is restricted to Claude Code clients (/v1/messages only)")
+		return
+	}
+
+	if decision := h.checkContentModeration(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, body); decision != nil && decision.Blocked {
+		h.responsesErrorResponse(c, contentModerationStatus(decision), contentModerationErrorCode(decision), decision.Message)
 		return
 	}
 
@@ -140,7 +149,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	}
 
 	// 2. Re-check billing
-	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription); err != nil {
+	if err := h.billingCacheService.CheckBillingEligibility(requestCtx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(requestCtx, apiKey)); err != nil {
 		reqLog.Info("gateway.responses.billing_check_failed", zap.Error(err))
 		status, code, message, retryAfter := billingErrorDetails(err)
 		if retryAfter > 0 {
@@ -151,9 +160,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	}
 
 	// Parse request for session hash
-	parsedReq, _ := service.ParseGatewayRequest(body, "responses")
+	bodyRef := service.NewRequestBodyRef(body)
+	parsedReq, _ := service.ParseGatewayRequest(bodyRef, "responses")
 	if parsedReq == nil {
-		parsedReq = &service.ParsedRequest{Model: reqModel, Stream: reqStream, Body: body}
+		parsedReq = &service.ParsedRequest{Model: reqModel, Stream: reqStream, Body: bodyRef}
 	}
 	parsedReq.SessionContext = &service.SessionContext{
 		ClientIP:  ip.GetClientIP(c),
@@ -166,13 +176,14 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	fs := NewFailoverState(h.maxAccountSwitches, false)
 
 	for {
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
 		if err != nil {
 			if len(fs.FailedAccountIDs) == 0 {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts: "+err.Error())
 				return
 			}
-			action := fs.HandleSelectionExhausted(c.Request.Context())
+			action := fs.HandleSelectionExhausted(requestCtx)
 			switch action {
 			case FailoverContinue:
 				continue
@@ -194,6 +205,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		accountReleaseFunc := selection.ReleaseFunc
 		if !selection.Acquired {
 			if selection.WaitPlan == nil {
+				markOpsRoutingCapacityLimited(c)
 				h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
 				return
 			}
@@ -219,7 +231,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
-		result, err := h.gatewayService.ForwardAsResponses(c.Request.Context(), c, account, forwardBody, parsedReq)
+		result, err := h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
 
 		if accountReleaseFunc != nil {
 			accountReleaseFunc()
@@ -233,7 +245,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 					h.handleResponsesFailoverExhausted(c, failoverErr, true)
 					return
 				}
-				action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
+				action := fs.HandleFailoverError(requestCtx, h.gatewayService, account.ID, account.Platform, failoverErr)
 				switch action {
 				case FailoverContinue:
 					continue
@@ -259,9 +271,11 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		inboundEndpoint := GetInboundEndpoint(c)
 		upstreamEndpoint := GetUpstreamEndpoint(c, account.Platform)
 
-		h.submitUsageRecordTask(func(ctx context.Context) {
+		quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
+		h.submitUsageRecordTask(c.Request.Context(), func(ctx context.Context) {
 			if err := h.gatewayService.RecordUsage(ctx, &service.RecordUsageInput{
 				Result:             result,
+				QuotaPlatform:      quotaPlatform,
 				APIKey:             apiKey,
 				User:               apiKey.User,
 				Account:            account,
@@ -302,6 +316,11 @@ func (h *GatewayHandler) handleResponsesFailoverExhausted(c *gin.Context, lastEr
 	statusCode := http.StatusBadGateway
 	if lastErr != nil && lastErr.StatusCode > 0 {
 		statusCode = lastErr.StatusCode
+	}
+	if lastErr != nil && service.IsOpenAISilentRefusalErrorBody(lastErr.ResponseBody) {
+		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
+		h.responsesErrorResponse(c, http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage())
+		return
 	}
 	h.responsesErrorResponse(c, statusCode, "server_error", "All available accounts exhausted")
 }
