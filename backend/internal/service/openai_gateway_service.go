@@ -22,6 +22,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
@@ -3865,6 +3866,10 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		lineStartsClientOutput := false
 		forceFlushFailedEvent := false
 		if data, ok := extractOpenAISSEDataLine(line); ok {
+			// Audit log: 累积 SSE 数据行
+			if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+				acc.AppendSSELine(data)
+			}
 			dataBytes := []byte(data)
 			trimmedData := strings.TrimSpace(data)
 			if needModelReplace && strings.Contains(data, mappedModel) {
@@ -3983,6 +3988,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
+	}
+
+	// Audit log: 捕获非流式响应体
+	if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+		acc.SetNonStreamingBody(body)
 	}
 
 	// Detect SSE responses from upstream and convert to JSON.
@@ -4750,6 +4760,10 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 		}
 		// Extract data from SSE line (supports both "data: " and "data:" formats)
 		if data, ok := extractOpenAISSEDataLine(line); ok {
+			// Audit log: 累积 SSE 数据行
+			if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+				acc.AppendSSELine(data)
+			}
 			dataBytes := []byte(data)
 			if openAIStreamEventIsTerminal(data) {
 				sawTerminalEvent = true
@@ -5175,6 +5189,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
+	}
+
+	// Audit log: 捕获非流式响应体
+	if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+		acc.SetNonStreamingBody(body)
 	}
 
 	// Detect SSE responses for ALL account types via Content-Type header.

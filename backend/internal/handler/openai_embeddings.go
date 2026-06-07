@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -156,6 +157,11 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		writerSizeBeforeForward := c.Writer.Size()
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			c.Request = c.Request.WithContext(auditlog.AccumulatorIntoContext(c.Request.Context(), acc))
+		}
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -209,6 +215,25 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 		}
 
 		h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, true, nil)
+		// Audit log: submit record on successful forward
+		h.submitOpenAIAudit(c, auditlog.SubmitRecordParams{
+			StartTime:   forwardStart,
+			RequestID:   result.RequestID,
+			UserID:      subject.UserID,
+			APIKeyID:    apiKey.ID,
+			GroupID:     apiKey.GroupID,
+			AccountID:   account.ID,
+			AccountName: account.Name,
+			Platform:    account.Platform,
+			Model:       result.Model,
+			RequestBody: string(forwardBody),
+			Acc:         auditlog.AccumulatorFromContext(c.Request.Context()),
+			Stream:      false,
+			Transport:   "http",
+			Duration:    result.Duration,
+			InputTokens: result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+		})
 		userAgent := c.GetHeader("User-Agent")
 		clientIP := ip.GetClientIP(c)
 		inboundEndpoint := GetInboundEndpoint(c)

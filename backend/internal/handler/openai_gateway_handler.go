@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
@@ -38,6 +39,7 @@ type OpenAIGatewayHandler struct {
 	imageLimiter             *imageConcurrencyLimiter
 	maxAccountSwitches       int
 	cfg                      *config.Config
+	auditLogger              *auditlog.Logger
 }
 
 func resolveOpenAIMessagesDispatchMappedModel(apiKey *service.APIKey, requestedModel string) string {
@@ -82,6 +84,7 @@ func NewOpenAIGatewayHandler(
 	errorPassthroughService *service.ErrorPassthroughService,
 	contentModerationService *service.ContentModerationService,
 	cfg *config.Config,
+	auditLogger *auditlog.Logger,
 ) *OpenAIGatewayHandler {
 	pingInterval := time.Duration(0)
 	maxAccountSwitches := 3
@@ -102,6 +105,7 @@ func NewOpenAIGatewayHandler(
 		imageLimiter:             &imageConcurrencyLimiter{},
 		maxAccountSwitches:       maxAccountSwitches,
 		cfg:                      cfg,
+		auditLogger:              auditLogger,
 	}
 }
 
@@ -359,6 +363,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		writerSizeBeforeForward := c.Writer.Size()
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			c.Request = c.Request.WithContext(auditlog.AccumulatorIntoContext(c.Request.Context(), acc))
+		}
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -459,6 +468,28 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		} else {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, true, nil)
 		}
+
+		// Audit log: submit record on successful forward
+		h.submitOpenAIAudit(c, auditlog.SubmitRecordParams{
+			StartTime:    forwardStart,
+			RequestID:    result.RequestID,
+			UserID:       subject.UserID,
+			APIKeyID:     apiKey.ID,
+			GroupID:      apiKey.GroupID,
+			AccountID:    account.ID,
+			AccountName:  account.Name,
+			Platform:     account.Platform,
+			Model:        result.Model,
+			RequestBody:  string(forwardBody),
+			Acc:          auditlog.AccumulatorFromContext(c.Request.Context()),
+			Stream:       reqStream,
+			Transport:    auditTransport(reqStream, false),
+			Duration:     result.Duration,
+			FirstTokenMs: result.FirstTokenMs,
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+			ClientDisconnect: result.ClientDisconnect,
+		})
 
 		// 捕获请求信息（用于异步记录，避免在 goroutine 中访问 gin.Context）
 		userAgent := c.GetHeader("User-Agent")
@@ -763,6 +794,11 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMappingMsg.MappedModel)
 		}
 		writerSizeBeforeForward := c.Writer.Size()
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			c.Request = c.Request.WithContext(auditlog.AccumulatorIntoContext(c.Request.Context(), acc))
+		}
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -859,6 +895,28 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, true, nil)
 		}
 
+		// Audit log: submit record on successful forward
+		h.submitOpenAIAudit(c, auditlog.SubmitRecordParams{
+			StartTime:    forwardStart,
+			RequestID:    result.RequestID,
+			UserID:       subject.UserID,
+			APIKeyID:     apiKey.ID,
+			GroupID:      apiKey.GroupID,
+			AccountID:    account.ID,
+			AccountName:  account.Name,
+			Platform:     account.Platform,
+			Model:        result.Model,
+			RequestBody:  string(forwardBody),
+			Acc:          auditlog.AccumulatorFromContext(c.Request.Context()),
+			Stream:       reqStream,
+			Transport:    auditTransport(reqStream, false),
+			Duration:     result.Duration,
+			FirstTokenMs: result.FirstTokenMs,
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+			ClientDisconnect: result.ClientDisconnect,
+		})
+
 		userAgent := c.GetHeader("User-Agent")
 		clientIP := ip.GetClientIP(c)
 		requestPayloadHash := service.HashUsageRequestPayload(body)
@@ -896,6 +954,18 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		)
 		return
 	}
+}
+
+// submitOpenAIAudit fills common fields and submits an audit record.
+func (h *OpenAIGatewayHandler) submitOpenAIAudit(c *gin.Context, p auditlog.SubmitRecordParams) {
+	if h.auditLogger == nil {
+		return
+	}
+	p.Endpoint = GetInboundEndpoint(c)
+	p.Method = c.Request.Method
+	p.UserAgent = c.GetHeader("User-Agent")
+	p.ClientIP = ip.GetClientIP(c)
+	h.auditLogger.SubmitRecord(p)
 }
 
 func resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel string, body []byte) (string, string) {
@@ -1497,6 +1567,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// WebSocket 首包可能很大，hash 必须在 hooks 外算成字符串，避免 AfterTurn 闭包保活请求体。
 		requestPayloadHash = service.HashUsageRequestPayload(wsFirstMessage)
 
+		// Audit log: inject accumulator into WS context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			ctx = auditlog.AccumulatorIntoContext(ctx, acc)
+		}
+		wsStartTime := time.Now()
 		if err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks); err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
@@ -1543,6 +1619,24 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return
 		}
 		reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
+		// Audit log: submit record on successful WS session
+		if h.auditLogger != nil {
+			h.submitOpenAIAudit(c, auditlog.SubmitRecordParams{
+				StartTime:   wsStartTime,
+				UserID:      subject.UserID,
+				APIKeyID:    apiKey.ID,
+				GroupID:     apiKey.GroupID,
+				AccountID:   account.ID,
+				AccountName: account.Name,
+				Platform:    account.Platform,
+				Model:       reqModel,
+				RequestBody: string(wsFirstMessage),
+				Acc:         auditlog.AccumulatorFromContext(ctx),
+				Stream:      true,
+				Transport:   "websocket",
+				Duration:    time.Since(wsStartTime),
+			})
+		}
 		return
 	}
 

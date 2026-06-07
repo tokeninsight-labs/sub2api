@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	pkgerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -54,6 +55,7 @@ type GatewayHandler struct {
 	maxAccountSwitchesGemini  int
 	cfg                       *config.Config
 	settingService            *service.SettingService
+	auditLogger               *auditlog.Logger
 }
 
 // NewGatewayHandler creates a new GatewayHandler
@@ -72,6 +74,7 @@ func NewGatewayHandler(
 	userMsgQueueService *service.UserMessageQueueService,
 	cfg *config.Config,
 	settingService *service.SettingService,
+	auditLogger *auditlog.Logger,
 ) *GatewayHandler {
 	pingInterval := time.Duration(0)
 	maxAccountSwitches := 10
@@ -109,6 +112,7 @@ func NewGatewayHandler(
 		maxAccountSwitchesGemini:  maxAccountSwitchesGemini,
 		cfg:                       cfg,
 		settingService:            settingService,
+		auditLogger:               auditLogger,
 	}
 }
 
@@ -438,6 +442,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if fs.SwitchCount > 0 {
 				requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 			}
+			// Audit log: inject accumulator into request context
+			if h.auditLogger != nil {
+				acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+				requestCtx = auditlog.AccumulatorIntoContext(requestCtx, acc)
+				c.Request = c.Request.WithContext(requestCtx)
+			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
 			if account.Platform == service.PlatformAntigravity {
@@ -498,6 +508,28 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				reqLog.Error("gateway.forward_failed", forwardFailedFields...)
 				return
 			}
+
+			// Audit log: submit record on successful forward
+			h.submitGatewayAudit(c, auditlog.SubmitRecordParams{
+				StartTime:   time.Now().Add(-result.Duration),
+				RequestID:   result.RequestID,
+				UserID:      subject.UserID,
+				APIKeyID:    apiKey.ID,
+				GroupID:     apiKey.GroupID,
+				AccountID:   account.ID,
+				AccountName: account.Name,
+				Platform:    account.Platform,
+				Model:       result.Model,
+				RequestBody: string(body),
+				Acc:         auditlog.AccumulatorFromContext(requestCtx),
+				Stream:      reqStream,
+				Transport:   auditTransport(reqStream, false),
+				Duration:    result.Duration,
+				FirstTokenMs: result.FirstTokenMs,
+				InputTokens: result.Usage.InputTokens,
+				OutputTokens: result.Usage.OutputTokens,
+				ClientDisconnect: result.ClientDisconnect,
+			})
 
 			// RPM 计数递增（Forward 成功后）
 			// 注意：TOCTOU 竞态是已知且可接受的设计权衡，与 WindowCost 一致的 soft-limit 模式。
@@ -783,6 +815,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if fs.SwitchCount > 0 {
 				requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 			}
+			// Audit log: inject accumulator into request context
+			if h.auditLogger != nil {
+				acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+				requestCtx = auditlog.AccumulatorIntoContext(requestCtx, acc)
+				c.Request = c.Request.WithContext(requestCtx)
+			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
@@ -896,6 +934,28 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				return
 			}
 
+			// Audit log: submit record on successful forward
+			h.submitGatewayAudit(c, auditlog.SubmitRecordParams{
+				StartTime:   time.Now().Add(-result.Duration),
+				RequestID:   result.RequestID,
+				UserID:      subject.UserID,
+				APIKeyID:    currentAPIKey.ID,
+				GroupID:     currentAPIKey.GroupID,
+				AccountID:   account.ID,
+				AccountName: account.Name,
+				Platform:    account.Platform,
+				Model:       result.Model,
+				RequestBody: string(attemptBody),
+				Acc:         auditlog.AccumulatorFromContext(requestCtx),
+				Stream:      reqStream,
+				Transport:   auditTransport(reqStream, false),
+				Duration:    result.Duration,
+				FirstTokenMs: result.FirstTokenMs,
+				InputTokens: result.Usage.InputTokens,
+				OutputTokens: result.Usage.OutputTokens,
+				ClientDisconnect: result.ClientDisconnect,
+			})
+
 			// RPM 计数递增（Forward 成功后）
 			// 注意：TOCTOU 竞态是已知且可接受的设计权衡，与 WindowCost 一致的 soft-limit 模式。
 			// 在高并发下可能短暂超出 RPM 限制，但不会导致请求失败。
@@ -965,6 +1025,29 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			return
 		}
 	}
+}
+
+// submitGatewayAudit fills common fields and submits an audit record.
+func (h *GatewayHandler) submitGatewayAudit(c *gin.Context, p auditlog.SubmitRecordParams) {
+	if h.auditLogger == nil {
+		return
+	}
+	p.Endpoint = GetInboundEndpoint(c)
+	p.Method = c.Request.Method
+	p.UserAgent = c.GetHeader("User-Agent")
+	p.ClientIP = ip.GetClientIP(c)
+	h.auditLogger.SubmitRecord(p)
+}
+
+// auditTransport returns the transport string for audit logging.
+func auditTransport(stream, ws bool) string {
+	if ws {
+		return "websocket"
+	}
+	if stream {
+		return "sse"
+	}
+	return "http"
 }
 
 // Models handles listing available models

@@ -93,6 +93,7 @@ type Config struct {
 	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
 	Update                  UpdateConfig                  `mapstructure:"update"`
 	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
+	AuditLog                AuditLogConfig                `mapstructure:"audit_log"`
 }
 
 type LogConfig struct {
@@ -173,6 +174,29 @@ type IdempotencyConfig struct {
 	CleanupIntervalSeconds int `mapstructure:"cleanup_interval_seconds"`
 	// CleanupBatchSize 每次清理的最大记录数。
 	CleanupBatchSize int `mapstructure:"cleanup_batch_size"`
+}
+
+// AuditLogConfig 审计日志配置。
+// 记录完整的 LLM 请求/响应 payload 到独立 NDJSON 文件，支持 lumberjack 文件轮转。
+type AuditLogConfig struct {
+	// Enabled 是否启用审计日志，默认关闭。
+	Enabled bool `mapstructure:"enabled"`
+	// Directory 审计日志文件目录，留空则使用 {DATA_DIR}/audit。
+	Directory string `mapstructure:"directory"`
+	// MaxSizeMB 单文件轮转阈值（MB）。
+	MaxSizeMB int `mapstructure:"max_size_mb"`
+	// MaxBackups 保留历史文件数量。
+	MaxBackups int `mapstructure:"max_backups"`
+	// MaxAgeDays 历史文件保留天数。
+	MaxAgeDays int `mapstructure:"max_age_days"`
+	// Compress 是否 gzip 压缩历史文件。
+	Compress bool `mapstructure:"compress"`
+	// BufferSize 异步写入 channel 缓冲容量（记录数）。
+	BufferSize int `mapstructure:"buffer_size"`
+	// Workers 写入协程数。
+	Workers int `mapstructure:"workers"`
+	// MaxBodyBytes 每个请求/响应体最大字节数（0=不限），超出后截断。
+	MaxBodyBytes int `mapstructure:"max_body_bytes"`
 }
 
 type LinuxDoConnectConfig struct {
@@ -1808,6 +1832,17 @@ func setDefaults() {
 	viper.SetDefault("idempotency.max_stored_response_len", 64*1024)
 	viper.SetDefault("idempotency.cleanup_interval_seconds", 60)
 	viper.SetDefault("idempotency.cleanup_batch_size", 500)
+
+	// Audit Log
+	viper.SetDefault("audit_log.enabled", false)
+	viper.SetDefault("audit_log.directory", "")
+	viper.SetDefault("audit_log.max_size_mb", 200)
+	viper.SetDefault("audit_log.max_backups", 30)
+	viper.SetDefault("audit_log.max_age_days", 90)
+	viper.SetDefault("audit_log.compress", true)
+	viper.SetDefault("audit_log.buffer_size", 4096)
+	viper.SetDefault("audit_log.workers", 2)
+	viper.SetDefault("audit_log.max_body_bytes", 0)
 
 	// Gateway
 	viper.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久

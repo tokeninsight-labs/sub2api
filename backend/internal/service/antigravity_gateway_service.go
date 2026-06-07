@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -3232,6 +3233,11 @@ func (s *AntigravityGatewayService) handleGeminiStreamingResponse(c *gin.Context
 					payload = string(inner)
 				}
 
+				// Audit log: 累积 SSE 数据
+				if acc := auditlog.AccumulatorFromContext(c.Request.Context()); acc != nil {
+					acc.AppendSSELine(payload)
+				}
+
 				// 解析 usage
 				if u := extractGeminiUsage(inner); u != nil {
 					usage = u
@@ -4085,7 +4091,12 @@ func (s *AntigravityGatewayService) handleClaudeStreamingResponse(c *gin.Context
 			lastDataAt = time.Now()
 
 			// 处理 SSE 行，转换为 Claude 格式
-			claudeEvents := processor.ProcessLine(strings.TrimRight(ev.line, "\r\n"))
+			trimmedLine := strings.TrimRight(ev.line, "\r\n")
+			// Audit log: 累积上游 SSE 数据
+			if acc := auditlog.AccumulatorFromContext(c.Request.Context()); acc != nil {
+				acc.AppendSSELine(trimmedLine)
+			}
+			claudeEvents := processor.ProcessLine(trimmedLine)
 			if len(claudeEvents) > 0 {
 				if firstTokenMs == nil {
 					ms := int(time.Since(startTime).Milliseconds())
@@ -4377,6 +4388,10 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 		c.Header("Content-Type", resp.Header.Get("Content-Type"))
 		c.Status(http.StatusOK)
 		_, _ = c.Writer.Write(respBody)
+		// Audit log: 记录非流式响应体
+		if acc := auditlog.AccumulatorFromContext(c.Request.Context()); acc != nil {
+			acc.SetNonStreamingBody(respBody)
+		}
 	}
 
 	// 构建计费结果

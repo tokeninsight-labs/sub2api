@@ -1116,3 +1116,37 @@ update:
   # Leave empty for direct connection (recommended for overseas servers)
   # 留空表示直连（适用于海外服务器）
   proxy_url: ""
+
+# =============================================================================
+# Audit Log Configuration（审计日志配置）
+# =============================================================================
+# Records complete request/response payloads for compliance and internal audit.
+# 记录完整的请求/响应载荷，用于合规和内部审计。
+# Disabled by default. Enable only when needed as it increases disk I/O and memory usage.
+# 默认关闭。仅在需要时启用，因为会增加磁盘 I/O 和内存使用。
+audit_log:
+  enabled: false
+  # Directory for audit log files (empty = {DATA_DIR}/audit or /app/data/audit)
+  # 审计日志文件目录（留空 = {DATA_DIR}/audit 或 /app/data/audit）
+  directory: ""
+  # Max file size before rotation (MB)
+  # 单文件滚动阈值（MB）
+  max_size_mb: 200
+  # Number of rotated files to keep
+  # 保留历史文件数量
+  max_backups: 30
+  # Days to keep old files
+  # 历史文件保留天数
+  max_age_days: 90
+  # Compress rotated files with gzip
+  # 是否用 gzip 压缩历史文件
+  compress: true
+  # Async write buffer size (records). Records are dropped when buffer is full.
+  # 异步写入缓冲区大小（记录数）。缓冲区满时丢弃记录。
+  buffer_size: 4096
+  # Number of writer goroutines
+  # 写入协程数
+  workers: 2
+  # Max body bytes per request/response (0 = unlimited)
+  # 每个请求/响应体最大字节数（0 = 不限制）
+  max_body_bytes: 0

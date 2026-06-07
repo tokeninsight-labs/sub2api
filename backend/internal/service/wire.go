@@ -9,7 +9,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/payment"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"go.uber.org/zap"
 	"github.com/google/wire"
 	"github.com/redis/go-redis/v9"
 )
@@ -585,6 +587,7 @@ var ProviderSet = wire.NewSet(
 	ProvideChannelMonitorRunner,
 	NewChannelMonitorRequestTemplateService,
 	ProvideUserPlatformQuotaUsageFlusher,
+	ProvideAuditLogger,
 )
 
 // ProvideUserPlatformQuotaUsageFlusher 创建并启动 UserPlatformQuotaUsageFlusher。
@@ -640,4 +643,28 @@ func ProvideChannelMonitorRunner(svc *ChannelMonitorService, settingService *Set
 	svc.SetScheduler(r)
 	r.Start()
 	return r
+}
+
+// ProvideAuditLogger 创建审计日志 Logger。
+// 当 audit_log.enabled=false 时返回 nil，所有消费方均需 nil-guard。
+func ProvideAuditLogger(cfg *config.Config) *auditlog.Logger {
+	if cfg == nil || !cfg.AuditLog.Enabled {
+		return nil
+	}
+	l, err := auditlog.New(auditlog.Config{
+		Directory:    cfg.AuditLog.Directory,
+		MaxSizeMB:    cfg.AuditLog.MaxSizeMB,
+		MaxBackups:   cfg.AuditLog.MaxBackups,
+		MaxAgeDays:   cfg.AuditLog.MaxAgeDays,
+		Compress:     cfg.AuditLog.Compress,
+		BufferSize:   cfg.AuditLog.BufferSize,
+		Workers:      cfg.AuditLog.Workers,
+		MaxBodyBytes: cfg.AuditLog.MaxBodyBytes,
+	})
+	if err != nil {
+		logger.L().Error("audit logger init failed", zap.Error(err))
+		return nil
+	}
+	logger.L().Info("audit logging enabled", zap.String("directory", cfg.AuditLog.Directory))
+	return l
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -675,6 +676,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		payload := openAICompatPayloadWithEventType(frame.Data, frame.EventType)
 		if strings.TrimSpace(payload) == "[DONE]" {
 			return false
+		}
+		// Audit log: 累积 SSE 数据行
+		if acc := auditlog.AccumulatorFromContext(c.Request.Context()); acc != nil {
+			acc.AppendSSELine(frame.Data)
 		}
 		return processDataLine(payload)
 	}

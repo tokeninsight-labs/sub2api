@@ -26,6 +26,7 @@ import (
 	"unsafe"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -7917,6 +7918,10 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 						lastDataAt = time.Now()
 					}
 					if data != "" {
+						// Audit log: 累积 SSE 数据行
+						if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+							acc.AppendSSELine(data)
+						}
 						if firstTokenMs == nil && data != "[DONE]" {
 							ms := int(time.Since(startTime).Milliseconds())
 							firstTokenMs = &ms
@@ -8206,6 +8211,11 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, anthropicTooLargeError)
 	if err != nil {
 		return nil, err
+	}
+
+	// Audit log: 捕获非流式响应体
+	if acc := auditlog.AccumulatorFromContext(ctx); acc != nil {
+		acc.SetNonStreamingBody(body)
 	}
 
 	// 解析usage

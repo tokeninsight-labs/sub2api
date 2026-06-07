@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -246,6 +247,11 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		var result *service.ForwardResult
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			c.Request = c.Request.WithContext(auditlog.AccumulatorIntoContext(c.Request.Context(), acc))
+		}
 		if account.Platform == service.PlatformGemini {
 			if h.geminiCompatService == nil {
 				h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Gemini compatibility service is not configured")
@@ -288,6 +294,27 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			)
 			return
 		}
+
+		// Audit log: submit record on successful forward
+		h.submitGatewayAudit(c, auditlog.SubmitRecordParams{
+			RequestID:    result.RequestID,
+			UserID:       subject.UserID,
+			APIKeyID:     apiKey.ID,
+			GroupID:      apiKey.GroupID,
+			AccountID:    account.ID,
+			AccountName:  account.Name,
+			Platform:     account.Platform,
+			Model:        result.Model,
+			RequestBody:  string(forwardBody),
+			Acc:          auditlog.AccumulatorFromContext(c.Request.Context()),
+			Stream:       reqStream,
+			Transport:    auditTransport(reqStream, false),
+			Duration:     result.Duration,
+			FirstTokenMs: result.FirstTokenMs,
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+			ClientDisconnect: result.ClientDisconnect,
+		})
 
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")

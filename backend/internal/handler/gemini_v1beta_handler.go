@@ -14,6 +14,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/gemini"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/googleapi"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
@@ -477,6 +478,11 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		if fs.SwitchCount > 0 {
 			requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 		}
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			requestCtx = auditlog.AccumulatorIntoContext(requestCtx, acc)
+		}
 		sessionGroupID := derefGroupID(apiKey.GroupID)
 		if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 			result, err = h.antigravityGatewayService.ForwardGemini(
@@ -518,6 +524,27 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		// 捕获请求信息（用于异步记录，避免在 goroutine 中访问 gin.Context）
 		userAgent := c.GetHeader("User-Agent")
 		clientIP := ip.GetClientIP(c)
+
+		// Audit log: submit record on successful forward
+		h.submitGatewayAudit(c, auditlog.SubmitRecordParams{
+			RequestID:    result.RequestID,
+			UserID:       authSubject.UserID,
+			APIKeyID:     apiKey.ID,
+			GroupID:      apiKey.GroupID,
+			AccountID:    account.ID,
+			AccountName:  account.Name,
+			Platform:     account.Platform,
+			Model:        result.Model,
+			RequestBody:  string(body),
+			Acc:          auditlog.AccumulatorFromContext(requestCtx),
+			Stream:       stream,
+			Transport:    auditTransport(stream, false),
+			Duration:     result.Duration,
+			FirstTokenMs: result.FirstTokenMs,
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+			ClientDisconnect: result.ClientDisconnect,
+		})
 
 		// 保存 Gemini 内容摘要会话（用于 Fallback 匹配）
 		if useDigestFallback && geminiDigestChain != "" && geminiPrefixHash != "" {

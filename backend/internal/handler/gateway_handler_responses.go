@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/auditlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -235,6 +236,11 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
+		// Audit log: inject accumulator into request context
+		if h.auditLogger != nil {
+			acc := auditlog.NewAccumulator(true, h.auditLogger.MaxBodyBytes())
+			requestCtx = auditlog.AccumulatorIntoContext(requestCtx, acc)
+		}
 		result, err := h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
 
 		if accountReleaseFunc != nil {
@@ -267,6 +273,27 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			)
 			return
 		}
+
+		// Audit log: submit record on successful forward
+		h.submitGatewayAudit(c, auditlog.SubmitRecordParams{
+			RequestID:    result.RequestID,
+			UserID:       subject.UserID,
+			APIKeyID:     apiKey.ID,
+			GroupID:      apiKey.GroupID,
+			AccountID:    account.ID,
+			AccountName:  account.Name,
+			Platform:     account.Platform,
+			Model:        result.Model,
+			RequestBody:  string(forwardBody),
+			Acc:          auditlog.AccumulatorFromContext(requestCtx),
+			Stream:       reqStream,
+			Transport:    auditTransport(reqStream, false),
+			Duration:     result.Duration,
+			FirstTokenMs: result.FirstTokenMs,
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+			ClientDisconnect: result.ClientDisconnect,
+		})
 
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")
